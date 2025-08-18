@@ -8,11 +8,16 @@
 (define-constant ERR_INVALID_PARAMS (err u8))
 (define-constant ERR_PAYMENT_LATE (err u9))
 (define-constant ERR_EARLY_EXIT (err u10))
+(define-constant ERR_DEPOSIT_ALREADY_PAID (err u11))
+(define-constant ERR_DEPOSIT_NOT_FOUND (err u12))
+(define-constant ERR_CLAIM_PERIOD_EXPIRED (err u13))
+(define-constant ERR_INSUFFICIENT_DEPOSIT (err u14))
 
 (define-constant CONTRACT_OWNER tx-sender)
 (define-constant LATE_PENALTY_RATE u5)
 (define-constant EARLY_EXIT_PENALTY_RATE u15)
 (define-constant COMPLETION_BONUS_RATE u10)
+(define-constant DAMAGE_CLAIM_WINDOW u1008)
 
 (define-data-var next-property-id uint u1)
 (define-data-var next-lease-id uint u1)
@@ -56,6 +61,19 @@
 )
 
 (define-map lease-payment-count uint uint)
+
+(define-map security-deposits 
+  uint 
+  {
+    lease-id: uint,
+    amount: uint,
+    deposited-block: uint,
+    is-claimed: bool,
+    claim-amount: uint,
+    claim-reason: (string-ascii 200),
+    claim-block: uint
+  }
+)
 
 (define-public (register-property (address (string-ascii 100)) (value uint) (monthly-rent uint) (equity-rate uint))
   (let ((property-id (var-get next-property-id)))
@@ -305,5 +323,126 @@
       ownership-achieved: (>= (get accumulated-equity lease) (get ownership-threshold lease))
     })
     ERR_LEASE_NOT_FOUND
+  )
+)
+
+(define-public (submit-security-deposit (lease-id uint) (deposit-amount uint))
+  (let 
+    (
+      (lease (unwrap! (map-get? leases lease-id) ERR_LEASE_NOT_FOUND))
+      (existing-deposit (map-get? security-deposits lease-id))
+    )
+    (asserts! (is-eq tx-sender (get tenant lease)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none existing-deposit) ERR_DEPOSIT_ALREADY_PAID)
+    (asserts! (> deposit-amount u0) ERR_INVALID_PARAMS)
+    
+    (try! (stx-transfer? deposit-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set security-deposits lease-id {
+      lease-id: lease-id,
+      amount: deposit-amount,
+      deposited-block: stacks-block-height,
+      is-claimed: false,
+      claim-amount: u0,
+      claim-reason: "",
+      claim-block: u0
+    })
+    
+    (ok deposit-amount)
+  )
+)
+
+(define-public (claim-deposit-damage (lease-id uint) (damage-amount uint) (reason (string-ascii 200)))
+  (let 
+    (
+      (lease (unwrap! (map-get? leases lease-id) ERR_LEASE_NOT_FOUND))
+      (property (unwrap! (map-get? properties (get property-id lease)) ERR_PROPERTY_NOT_FOUND))
+      (deposit (unwrap! (map-get? security-deposits lease-id) ERR_DEPOSIT_NOT_FOUND))
+      (lease-end-block (get end-block lease))
+      (current-block stacks-block-height)
+      (claim-deadline (+ lease-end-block DAMAGE_CLAIM_WINDOW))
+    )
+    (asserts! (is-eq tx-sender (get owner property)) ERR_NOT_AUTHORIZED)
+    (asserts! (not (get is-active lease)) ERR_LEASE_ACTIVE)
+    (asserts! (<= current-block claim-deadline) ERR_CLAIM_PERIOD_EXPIRED)
+    (asserts! (not (get is-claimed deposit)) ERR_DEPOSIT_ALREADY_PAID)
+    (asserts! (<= damage-amount (get amount deposit)) ERR_INSUFFICIENT_DEPOSIT)
+    
+    (let ((refund-amount (- (get amount deposit) damage-amount)))
+      (if (> damage-amount u0)
+        (try! (as-contract (stx-transfer? damage-amount tx-sender (get owner property))))
+        true)
+      
+      (if (> refund-amount u0)
+        (try! (as-contract (stx-transfer? refund-amount tx-sender (get tenant lease))))
+        true)
+      
+      (map-set security-deposits lease-id (merge deposit {
+        is-claimed: true,
+        claim-amount: damage-amount,
+        claim-reason: reason,
+        claim-block: current-block
+      }))
+      
+      (ok {damage-claimed: damage-amount, tenant-refund: refund-amount})
+    )
+  )
+)
+
+(define-public (auto-refund-deposit (lease-id uint))
+  (let 
+    (
+      (lease (unwrap! (map-get? leases lease-id) ERR_LEASE_NOT_FOUND))
+      (deposit (unwrap! (map-get? security-deposits lease-id) ERR_DEPOSIT_NOT_FOUND))
+      (lease-end-block (get end-block lease))
+      (current-block stacks-block-height)
+      (claim-deadline (+ lease-end-block DAMAGE_CLAIM_WINDOW))
+      (refund-amount (get amount deposit))
+    )
+    (asserts! (not (get is-active lease)) ERR_LEASE_ACTIVE)
+    (asserts! (> current-block claim-deadline) ERR_CLAIM_PERIOD_EXPIRED)
+    (asserts! (not (get is-claimed deposit)) ERR_DEPOSIT_ALREADY_PAID)
+    
+    (try! (as-contract (stx-transfer? refund-amount tx-sender (get tenant lease))))
+    
+    (map-set security-deposits lease-id (merge deposit {
+      is-claimed: true,
+      claim-amount: u0,
+      claim-reason: "Auto-refund after claim period",
+      claim-block: current-block
+    }))
+    
+    (ok refund-amount)
+  )
+)
+
+(define-read-only (get-security-deposit (lease-id uint))
+  (map-get? security-deposits lease-id)
+)
+
+(define-read-only (get-deposit-claim-status (lease-id uint))
+  (match (map-get? security-deposits lease-id)
+    deposit (match (map-get? leases lease-id)
+      lease (let 
+        (
+          (lease-end-block (get end-block lease))
+          (current-block stacks-block-height)
+          (claim-deadline (+ lease-end-block DAMAGE_CLAIM_WINDOW))
+        )
+        (ok {
+          deposit-amount: (get amount deposit),
+          is-claimed: (get is-claimed deposit),
+          claim-amount: (get claim-amount deposit),
+          blocks-until-auto-refund: (if (and (> claim-deadline current-block) (not (get is-active lease))) 
+                                     (- claim-deadline current-block) 
+                                     u0),
+          can-auto-refund: (and (not (get is-claimed deposit)) 
+                               (not (get is-active lease)) 
+                               (> current-block claim-deadline))
+        })
+      )
+      ERR_LEASE_NOT_FOUND
+    )
+    ERR_DEPOSIT_NOT_FOUND
   )
 )
