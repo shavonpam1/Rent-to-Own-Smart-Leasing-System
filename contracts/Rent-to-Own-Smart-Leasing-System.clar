@@ -75,6 +75,19 @@
   }
 )
 
+(define-map payment-analytics
+  uint
+  {
+    lease-id: uint,
+    total-on-time-payments: uint,
+    total-late-payments: uint,
+    consecutive-on-time-payments: uint,
+    longest-on-time-streak: uint,
+    average-payment-delay: uint,
+    payment-health-score: uint
+  }
+)
+
 (define-public (register-property (address (string-ascii 100)) (value uint) (monthly-rent uint) (equity-rate uint))
   (let ((property-id (var-get next-property-id)))
     (asserts! (> value u0) ERR_INVALID_PARAMS)
@@ -120,6 +133,15 @@
       ownership-threshold: ownership-threshold
     })
     (map-set lease-payment-count lease-id u0)
+    (map-set payment-analytics lease-id {
+      lease-id: lease-id,
+      total-on-time-payments: u0,
+      total-late-payments: u0,
+      consecutive-on-time-payments: u0,
+      longest-on-time-streak: u0,
+      average-payment-delay: u0,
+      payment-health-score: u100
+    })
     (var-set next-lease-id (+ lease-id u1))
     (ok lease-id)
   )
@@ -155,6 +177,8 @@
     })
     
     (map-set lease-payment-count lease-id new-payment-count)
+    
+    (update-payment-analytics lease-id is-late (if is-late (- current-block expected-payment-block) u0))
     
     (let ((updated-lease (merge lease {
       total-payments: (+ (get total-payments lease) total-amount),
@@ -228,6 +252,53 @@
       is-available: false
     }))
     (ok true)
+  )
+)
+
+(define-private (update-payment-analytics (lease-id uint) (was-late bool) (delay-blocks uint))
+  (let 
+    (
+      (current-analytics (default-to 
+        {
+          lease-id: lease-id,
+          total-on-time-payments: u0,
+          total-late-payments: u0,
+          consecutive-on-time-payments: u0,
+          longest-on-time-streak: u0,
+          average-payment-delay: u0,
+          payment-health-score: u100
+        }
+        (map-get? payment-analytics lease-id)))
+      (new-on-time-count (if was-late 
+                          (get total-on-time-payments current-analytics)
+                          (+ (get total-on-time-payments current-analytics) u1)))
+      (new-late-count (if was-late 
+                       (+ (get total-late-payments current-analytics) u1)
+                       (get total-late-payments current-analytics)))
+      (new-consecutive (if was-late 
+                        u0 
+                        (+ (get consecutive-on-time-payments current-analytics) u1)))
+      (new-longest-streak (if (> new-consecutive (get longest-on-time-streak current-analytics))
+                           new-consecutive
+                           (get longest-on-time-streak current-analytics)))
+      (total-payments (+ new-on-time-count new-late-count))
+      (new-avg-delay (if (> total-payments u0)
+                      (/ (+ (* (get average-payment-delay current-analytics) (- total-payments u1)) delay-blocks) total-payments)
+                      u0))
+      (new-health-score (if (> total-payments u0)
+                         (/ (* new-on-time-count u100) total-payments)
+                         u100))
+    )
+    (map-set payment-analytics lease-id {
+      lease-id: lease-id,
+      total-on-time-payments: new-on-time-count,
+      total-late-payments: new-late-count,
+      consecutive-on-time-payments: new-consecutive,
+      longest-on-time-streak: new-longest-streak,
+      average-payment-delay: new-avg-delay,
+      payment-health-score: new-health-score
+    })
+    true
   )
 )
 
@@ -444,5 +515,45 @@
       ERR_LEASE_NOT_FOUND
     )
     ERR_DEPOSIT_NOT_FOUND
+  )
+)
+(define-read-only (get-payment-analytics (lease-id uint))
+  (map-get? payment-analytics lease-id)
+)
+
+(define-read-only (get-payment-health-score (lease-id uint))
+  (match (map-get? payment-analytics lease-id)
+    analytics (ok (get payment-health-score analytics))
+    ERR_LEASE_NOT_FOUND
+  )
+)
+
+(define-read-only (get-payment-trends (lease-id uint))
+  (match (map-get? payment-analytics lease-id)
+    analytics (ok {
+      on-time-percentage: (get payment-health-score analytics),
+      consecutive-streak: (get consecutive-on-time-payments analytics),
+      best-streak: (get longest-on-time-streak analytics),
+      average-delay-blocks: (get average-payment-delay analytics),
+      total-payments: (+ (get total-on-time-payments analytics) (get total-late-payments analytics))
+    })
+    ERR_LEASE_NOT_FOUND
+  )
+)
+
+(define-read-only (is-reliable-tenant (lease-id uint))
+  (match (map-get? payment-analytics lease-id)
+    analytics (let 
+      (
+        (health-score (get payment-health-score analytics))
+        (total-payments (+ (get total-on-time-payments analytics) (get total-late-payments analytics)))
+      )
+      (ok (and 
+        (>= health-score u80)
+        (>= total-payments u3)
+        (>= (get consecutive-on-time-payments analytics) u2)
+      ))
+    )
+    ERR_LEASE_NOT_FOUND
   )
 )
