@@ -1,0 +1,25 @@
+[project]
+name = 'Rent-to-Own-Smart-Leasing-System'
+description = 'A revolutionary Clarity smart contract that transforms traditional renting into a pathway to homeownership'
+authors = ['shavonpam1']
+telemetry = true
+cache_dir = './.cache'
+requirements = []
+
+[contracts.rent-to-own-system]
+path = 'contracts/rent-to-own-system.clar'
+clarity_version = 3
+epoch = 3.1
+
+[repl.analysis]
+passes = ['check_checker']
+
+[repl.analysis.check_checker]
+strict = false
+trusted_sender = false
+trusted_caller = false
+callee_filter = false
+
+[repl.remote_data]
+enabled = false
+api_url = 'https://api.hiro.so'
