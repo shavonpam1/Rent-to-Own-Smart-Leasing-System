@@ -136,6 +136,11 @@
 
 (define-map policy-payment-count uint uint)
 
+(define-map property-managers
+  {property-id: uint, manager: principal}
+  bool
+)
+
 ;; Core Leasing Functions
 (define-public (register-property (address (string-ascii 100)) (value uint) (monthly-rent uint) (equity-rate uint))
   (let ((property-id (var-get next-property-id)))
@@ -163,8 +168,9 @@
       (current-block stacks-block-height)
       (end-block (+ current-block lease-duration))
       (ownership-threshold (/ (* (get value property) u80) u100))
+      (is-manager (default-to false (map-get? property-managers {property-id: property-id, manager: tx-sender})))
     )
-    (asserts! (is-eq tx-sender (get owner property)) ERR_NOT_AUTHORIZED)
+    (asserts! (or (is-eq tx-sender (get owner property)) is-manager) ERR_NOT_AUTHORIZED)
     (asserts! (get is-available property) ERR_LEASE_ACTIVE)
     (asserts! (> lease-duration u0) ERR_INVALID_PARAMS)
     
@@ -489,6 +495,30 @@
     )
     ERR_INSURANCE_NOT_FOUND
   )
+)
+
+(define-public (assign-property-manager (property-id uint) (manager principal))
+  (let (
+      (property (unwrap! (map-get? properties property-id) ERR_PROPERTY_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner property)) ERR_NOT_AUTHORIZED)
+    (map-set property-managers {property-id: property-id, manager: manager} true)
+    (ok true)
+  )
+)
+
+(define-public (revoke-property-manager (property-id uint) (manager principal))
+  (let (
+      (property (unwrap! (map-get? properties property-id) ERR_PROPERTY_NOT_FOUND))
+    )
+    (asserts! (is-eq tx-sender (get owner property)) ERR_NOT_AUTHORIZED)
+    (map-delete property-managers {property-id: property-id, manager: manager})
+    (ok true)
+  )
+)
+
+(define-read-only (is-property-manager? (property-id uint) (who principal))
+  (default-to false (map-get? property-managers {property-id: property-id, manager: who}))
 )
 
 (define-read-only (get-total-properties)
